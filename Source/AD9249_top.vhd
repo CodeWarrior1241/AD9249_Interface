@@ -1,37 +1,29 @@
 library IEEE;
 use IEEE.STD_LOGIC_1164.all;
+use IEEE.STD_LOGIC_UNSIGNED.all;
 
 entity AD9249_top is 
-  port (
-    RESET     : in  std_logic;
-	
+  port (	
 	-- AD9249 Clocks
 	--SAMP_CLK_P : in std_logic; -- Not needed
 	--SAMP_CLK_M : in std_logic;
 	
-	FCO_1_P : in std_logic; -- Frame Clock
-	FCO_1_M : in std_logic;
-	FCO_2_P : in std_logic;
-	FCO_2_M : in std_logic;
-	
-	DCO_1_P : in std_logic; -- Data Clock (7x frame clock, phase shifted)
-	DCO_1_M : in std_logic;
-	DCO_2_P : in std_logic;
-	DCO_2_M : in std_logic;
+	FCO_clk_p : in std_logic; -- Frame Clock
+	FCO_clk_n : in std_logic;
+	DCO_clk_p : in std_logic; -- Data Clock (7x frame clock, phase shifted)
+	DCO_clk_n : in std_logic;
 	
 	-- AD9249 Data	
-	DATA_BANK_1_P  : in std_logic_vector(7 downto 0);
-	DATA_BANK_1_M  : in std_logic_vector(7 downto 0);
-	DATA_BANK_2_P  : in std_logic_vector(7 downto 0);
-	DATA_BANK_2_M  : in std_logic_vector(7 downto 0);
+	adc_raw_samples_in_p  : in std_logic_vector(7 downto 0);
+	adc_raw_samples_in_n  : in std_logic_vector(7 downto 0)
 	
 	-- AD9249 SPI
-	CSB1 : out std_logic;
-	CSB2 : out std_logic;
-	SCLK : out std_logic;
-	SDIO : out std_logic; -- technically inout
+	--CSB1 : out std_logic;
+	--CSB2 : out std_logic;
+	--SCLK : out std_logic;
+	--SDIO : out std_logic; -- technically inout
 	
-	PDWN : out std_logic	
+	--PDWN : out std_logic	
   );
 end AD9249_top;
 
@@ -48,13 +40,33 @@ architecture STRUCTURE of AD9249_top is
     PACKED_VALID  : out std_logic
   );
   end component sample_packer;
-      
+  
+  component sample_ram
+  port (
+    clka  : IN STD_LOGIC;
+    wea   : IN STD_LOGIC_VECTOR(0 DOWNTO 0);
+    addra : IN STD_LOGIC_VECTOR(5 DOWNTO 0);
+    dina  : IN STD_LOGIC_VECTOR(13 DOWNTO 0);
+    clkb  : IN STD_LOGIC;
+    addrb : IN STD_LOGIC_VECTOR(5 DOWNTO 0);
+    doutb : OUT STD_LOGIC_VECTOR(13 DOWNTO 0)
+  );
+  end component sample_ram; 
+     
   component IBUFDS
   port (
 	  O  : out std_logic;
 	  I  : in  std_logic;
 	  IB : in  std_logic
 	);
+  end component IBUFDS;
+         
+  component IBUFGDS
+  port (
+    O  : out std_logic;
+    I  : in  std_logic;
+    IB : in  std_logic
+  );
   end component IBUFDS;
   
   component IDDR
@@ -72,86 +84,74 @@ architecture STRUCTURE of AD9249_top is
   );
   end component IDDR;
 -- Signals
-signal DCO_1, DCO_2 : std_logic;
-signal FCO_1, FCO_2 : std_logic;
-signal DATA_BANK_1_BUF_o, DATA_BANK_2_BUF_o : std_logic_vector(7 downto 0);
-signal DATA_BANK_1_DDR_i, DATA_BANK_2_DDR_i : std_logic_vector(7 downto 0);
-signal DATA_BANK_1_R, DATA_BANK_1_F : std_logic_vector(7 downto 0);
-signal DATA_BANK_2_R, DATA_BANK_2_F : std_logic_vector(7 downto 0);
+signal DCO_clk : std_logic;
+signal FCO_clk : std_logic;
+signal DATA_BANK_BUF_o : std_logic_vector(7 downto 0);
+signal DATA_BANK_DDR_i : std_logic_vector(7 downto 0);
+signal DATA_BANK_R, DATA_BANK_F : std_logic_vector(7 downto 0);
 
 type T_2Dsample is array (natural range <>) of std_logic_vector(13 downto 0);
-signal PACKED_SAMPLE_1, PACKED_SAMPLE_2 : T_2Dsample(7 downto 0);
-signal PACKED_VALID_1, PACKED_VALID_2 : std_logic_vector(7 downto 0);
+signal PACKED_SAMPLE : T_2Dsample(7 downto 0);
+signal PACKED_VALID  : std_logic_vector(7 downto 0);
 
-type RAM is array (1024 downto 0) of T_2Dsample(7 downto 0);
-signal DATA_STORE_1, DATA_STORE_2 : RAM;
+signal sample_count_d, sample_count_q : std_logic_vector(5 downto 0);
+signal debug_sample : T_2Dsample(7 downto 0);
+signal delay_rst_q, delay_rst_d : std_logic_vector(15 downto 0) := (others => '1');
+signal reset : std_logic;
 
 attribute mark_debug : string;
 attribute keep : string;
 
-attribute mark_debug of DATA_STORE_1 : signal is "true";
-attribute mark_debug of DATA_STORE_2 : signal is "true";
+attribute mark_debug of debug_sample : signal is "true";
     
 begin
-  -----------
-  -- Outputs 
-  -----------
-  CSB1 <= '1';
-  CSB2 <= '1';
-  SCLK <= '0';
-  SDIO <= '0';
-  PDWN <= '0';
   
   ---------------
   -- Data Capture
   ---------------
   G_PACK : for i in 0 to 7 generate
-    BANK1 : sample_packer
+    U_SAMPLE_PACKER : sample_packer
     port map (
-      RESET         => RESET,
-      FRAME_CLK     => FCO_1, 
-      DATA_CLK      => DCO_1,
-      DATA_SAMPLE_R => DATA_BANK_1_R(i),
-      DATA_SAMPLE_F => DATA_BANK_1_F(i),
+      RESET         => reset,
+      FRAME_CLK     => FCO_clk, 
+      DATA_CLK      => DCO_clk,
+      DATA_SAMPLE_R => DATA_BANK_R(i),
+      DATA_SAMPLE_F => DATA_BANK_F(i),
       
-      PACKED_SAMPLE => PACKED_SAMPLE_1(i),
-      PACKED_VALID  => PACKED_VALID_1(i)
-    );
-   
-    BANK2 : sample_packer
-    port map (
-      RESET         => RESET,
-      FRAME_CLK     => FCO_2, 
-      DATA_CLK      => DCO_2,
-      DATA_SAMPLE_R => DATA_BANK_2_R(i),
-      DATA_SAMPLE_F => DATA_BANK_2_F(i),
-            
-      PACKED_SAMPLE => PACKED_SAMPLE_2(i),
-      PACKED_VALID  => PACKED_VALID_2(i)
+      PACKED_SAMPLE => PACKED_SAMPLE(i),
+      PACKED_VALID  => PACKED_VALID(i)
     );
   end generate G_PACK;
   
   -----------
   -- Storage
   -----------
-  G_FILL : for i in 0 to 7 generate
-    S_FILL_1 : process (PACKED_VALID_1(i))
-    variable samp_count : integer range 0 to 1023 := 0;
-    begin
-      if (PACKED_VALID_1(i) = '1') then 
-        DATA_STORE_1(samp_count)(i) <= PACKED_SAMPLE_1(i);
-        samp_count := samp_count + 1;
-      end if;
-    end process S_FILL_1;  
+  C_SAMPLE_COUNT : process (FCO_clk, PACKED_VALID)
+  begin
+    if(PACKED_VALID(0) = '1') then
+      sample_count_d <= sample_count_q + 1;
+    else
+      sample_count_d <= sample_count_q;
+    end if;
     
-    S_FILL_2 : process (PACKED_VALID_2(i))
-      variable samp_count : integer range 0 to 1023 := 0;
-      begin
-        if (PACKED_VALID_2(i) = '1') then 
-          DATA_STORE_2(samp_count)(i) <= PACKED_SAMPLE_2(i);
-          samp_count := samp_count + 1;
-        end if;
-     end process S_FILL_2; 
+    if(reset = '1') then
+      sample_count_q <= (others => '0');
+    elsif(rising_edge(FCO_clk)) then
+      sample_count_q <= sample_count_d;       
+    end if;
+  end process C_SAMPLE_COUNT;
+      
+  G_FILL : for i in 0 to 7 generate
+   U_STORE_SAMPLE : sample_ram
+   port map (
+     clka  => FCO_clk,
+     wea   => PACKED_VALID(i downto i),
+     addra => sample_count_q,
+     dina  => PACKED_SAMPLE(i),
+     clkb  => FCO_clk,
+     addrb => sample_count_q,
+     doutb => debug_sample(i)
+   ); 
    end generate G_FILL;          
   
   -------------------
@@ -159,76 +159,53 @@ begin
   -------------------
   
   -- Clocks
-  DCO_1_CLK : IBUFDS  -- IBUFGDS may be necessary
+  DCO_CLK : IBUFDS 
   port map (
-    O  => DCO_1,
-    I  => DCO_1_P,
-    IB => DCO_1_M
+    O  => DCO_clk,
+    I  => DCO_clk_p,
+    IB => DCO_clk_n
   );  
   
-  DCO_2_CLK : IBUFDS
-  port map (
-    O  => DCO_2,
-    I  => DCO_2_P,
-    IB => DCO_2_M
-  ); 
   
-  FCO_1_CLK : IBUFDS 
+  FCO_CLK : IBUFDS 
   port map (
-    O  => FCO_1,
-    I  => FCO_1_P,
-    IB => FCO_1_M
+    O  => FCO_clk,
+    I  => FCO_clk_p,
+    IB => FCO_clk_n
   );  
   
-  FCO_2_CLK : IBUFDS
-  port map (
-    O  => FCO_2,
-    I  => FCO_2_P,
-    IB => FCO_2_M
-  ); 
-  
-  DATA_BANK_1_DDR_i <= DATA_BANK_1_BUF_o;
-  DATA_BANK_2_DDR_i <= DATA_BANK_2_BUF_o;
+  DATA_BANK_DDR_i <= DATA_BANK_BUF_o;
   -- Data
   G_DATA : for i in 0 to 7 generate
     DATA_BANK_1 : IBUFDS
     port map (
-      O  => DATA_BANK_1_BUF_o(i),
-      I  => DATA_BANK_1_P(i),
-      IB => DATA_BANK_1_M(i)
+      O  => DATA_BANK_BUF_o(i),
+      I  => adc_raw_samples_in_p(i),
+      IB => adc_raw_samples_in_n(i)
     );
 	
 	SAMP_1 : IDDR
 	generic map (
 	  DDR_CLK_EDGE => "SAME_EDGE_PIPELINED"
     ) port map (
-	  Q1 => DATA_BANK_1_R(i),
-	  Q2 => DATA_BANK_1_F(i),
-	  C  => DCO_1,
+	  Q1 => DATA_BANK_R(i),
+	  Q2 => DATA_BANK_F(i),
+	  C  => DCO_clk,
 	  CE => '1',
-	  D  => DATA_BANK_1_DDR_i(i) ,
-	  R  => RESET,
+	  D  => DATA_BANK_DDR_i(i) ,
+	  R  => reset,
 	  S  => '0'
 	);
-	
-    DATA_BANK_2 : IBUFDS
-    port map (
-      O  => DATA_BANK_2_BUF_o(i),
-      I  => DATA_BANK_2_P(i),
-      IB => DATA_BANK_2_M(i)
-    );
-          
-    SAMP_2 : IDDR
-    generic map (
-      DDR_CLK_EDGE => "SAME_EDGE_PIPELINED"
-    ) port map (
-      Q1 => DATA_BANK_2_R(i),
-      Q2 => DATA_BANK_2_F(i),
-      C  => DCO_2,
-      CE => '1',
-      D  => DATA_BANK_2_DDR_i(i) ,
-      R  => RESET,
-      S  => '0'
-    );    
   end generate G_DATA;
+  
+  reset <= delay_rst_q(15);
+  
+  S_RESET : process (DCO_clk, delay_rst_q)
+  begin 
+    delay_rst_d <= delay_rst_q(14 downto 0) & '0';
+    if (rising_edge(DCO_clk)) then
+      delay_rst_q <= delay_rst_d;
+    end if;
+  end process S_RESET;
+    
 end STRUCTURE;

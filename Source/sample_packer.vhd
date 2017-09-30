@@ -27,7 +27,8 @@ begin
  PACKED_SAMPLE <= samp_store_q;
  PACKED_VALID <= '1' when bit_pos_qq = 1 else '0';
  
-  C_SAMPLE : process(frame_clk_qq, frame_clk_q, bit_pos_q)
+  C_SAMPLE : process(frame_clk_qq, frame_clk_q, samp_store_q, 
+                     DATA_SAMPLE_R, DATA_SAMPLE_F, bit_pos_d, bit_pos_q)
   begin
     samp_store_d <= samp_store_q;
     
